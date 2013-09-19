@@ -1,2 +1,3 @@
 do-not-check-elementtree-at-build-time.patch
 fix-manpage-typos.patch
+add-s3cmd-and-libs

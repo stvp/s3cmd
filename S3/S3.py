@@ -6,7 +6,6 @@
 import sys
 import os, os.path
 import time
-import errno
 import httplib
 import logging
 import mimetypes
@@ -28,7 +27,6 @@ from Config import Config
 from Exceptions import *
 from MultiPart import MultiPartUpload
 from S3Uri import S3Uri
-from ConnMan import ConnMan
 
 try:
     import magic, gzip
@@ -94,9 +92,6 @@ class S3Request(object):
         # Add in any extra headers from s3 config object
         if self.s3.config.extra_headers:
             self.headers.update(self.s3.config.extra_headers)
-        if len(self.s3.config.access_token)>0:
-            self.s3.config.role_refresh()
-            self.headers['x-amz-security-token']=self.s3.config.access_token
         self.resource = resource
         self.method_string = method_string
         self.params = params
@@ -192,6 +187,15 @@ class S3(object):
     def __init__(self, config):
         self.config = config
 
+    def get_connection(self, bucket):
+        if self.config.proxy_host != "":
+            return httplib.HTTPConnection(self.config.proxy_host, self.config.proxy_port)
+        else:
+            if self.config.use_https:
+                return httplib.HTTPSConnection(self.get_hostname(bucket))
+            else:
+                return httplib.HTTPConnection(self.get_hostname(bucket))
+
     def get_hostname(self, bucket):
         if bucket and check_bucket_name_dns_conformity(bucket):
             if self.redir_map.has_key(bucket):
@@ -239,9 +243,10 @@ class S3(object):
         truncated = True
         list = []
         prefixes = []
+        conn = self.get_connection(bucket)
 
         while truncated:
-            response = self.bucket_list_noparse(bucket, prefix, recursive, uri_params)
+            response = self.bucket_list_noparse(conn, bucket, prefix, recursive, uri_params)
             current_list = _get_contents(response["data"])
             current_prefixes = _get_common_prefixes(response["data"])
             truncated = _list_truncated(response["data"])
@@ -255,17 +260,19 @@ class S3(object):
             list += current_list
             prefixes += current_prefixes
 
+        conn.close()
+
         response['list'] = list
         response['common_prefixes'] = prefixes
         return response
 
-    def bucket_list_noparse(self, bucket, prefix = None, recursive = None, uri_params = {}):
+    def bucket_list_noparse(self, connection, bucket, prefix = None, recursive = None, uri_params = {}):
         if prefix:
             uri_params['prefix'] = self.urlencode_string(prefix)
         if not self.config.recursive and not recursive:
             uri_params['delimiter'] = "/"
         request = self.create_request("BUCKET_LIST", bucket = bucket, **uri_params)
-        response = self.send_request(request)
+        response = self.send_request(request, conn = connection)
         #debug(response)
         return response
 
@@ -406,15 +413,16 @@ class S3(object):
 
         ## MIME-type handling
         content_type = self.config.mime_type
-        content_encoding = None
         if filename != "-" and not content_type and self.config.guess_mime_type:
             (content_type, content_encoding) = mime_magic(filename)
         if not content_type:
             content_type = self.config.default_mime_type
+        if not content_encoding:
+            content_encoding = self.config.encoding.upper()
 
         ## add charset to content type
-        if self.add_encoding(filename, content_type):
-            content_type = content_type + "; charset=" + self.config.encoding.upper()
+        if self.add_encoding(filename, content_type) and content_encoding is not None:
+            content_type = content_type + "; charset=" + content_encoding
 
         headers["content-type"] = content_type
         if content_encoding is not None:
@@ -512,27 +520,15 @@ class S3(object):
         response = self.send_request(request, body)
         return response
 
-    def get_policy(self, uri):
-        request = self.create_request("BUCKET_LIST", bucket = uri.bucket(), extra = "?policy")
-        response = self.send_request(request)
-        return response['data']
-
     def set_policy(self, uri, policy):
-        headers = {}
-        # TODO check policy is proper json string
-        headers['content-type'] = 'application/json'
-        request = self.create_request("BUCKET_CREATE", uri = uri,
-                                      extra = "?policy", headers=headers)
-        body = policy
-        debug(u"set_policy(%s): policy-json: %s" % (uri, body))
-        request.sign()
-        response = self.send_request(request, body=body)
-        return response
+        if uri.has_object():
+            request = self.create_request("OBJECT_PUT", uri = uri, extra = "?policy")
+        else:
+            request = self.create_request("BUCKET_CREATE", bucket = uri.bucket(), extra = "?policy")
 
-    def delete_policy(self, uri):
-        request = self.create_request("BUCKET_DELETE", uri = uri, extra = "?policy")
-        debug(u"delete_policy(%s)" % uri)
-        response = self.send_request(request)
+        body = str(policy)
+        debug(u"set_policy(%s): policy-json: %s" % (uri, body))
+        response = self.send_request(request, body)
         return response
 
     def get_accesslog(self, uri):
@@ -650,7 +646,7 @@ class S3(object):
         # Wait a few seconds. The more it fails the more we wait.
         return (self._max_retries - retries + 1) * 3
 
-    def send_request(self, request, body = None, retries = _max_retries):
+    def send_request(self, request, body = None, retries = _max_retries, conn = None):
         method_string, resource, headers = request.get_triplet()
         debug("Processing request, please wait...")
         if not headers.has_key('content-length'):
@@ -659,23 +655,25 @@ class S3(object):
             # "Stringify" all headers
             for header in headers.keys():
                 headers[header] = str(headers[header])
-            conn = ConnMan.get(self.get_hostname(resource['bucket']))
+            if conn is None:
+                debug("Establishing connection")
+                conn = self.get_connection(resource['bucket'])
+                close_conn = True
+            else:
+                debug("Using existing connection")
+                close_conn = False
             uri = self.format_uri(resource)
             debug("Sending request method_string=%r, uri=%r, headers=%r, body=(%i bytes)" % (method_string, uri, headers, len(body or "")))
-            conn.c.request(method_string, uri, body, headers)
+            conn.request(method_string, uri, body, headers)
             response = {}
-            http_response = conn.c.getresponse()
+            http_response = conn.getresponse()
             response["status"] = http_response.status
             response["reason"] = http_response.reason
             response["headers"] = convertTupleListToDict(http_response.getheaders())
             response["data"] =  http_response.read()
-            if response["headers"].has_key("x-amz-meta-s3cmd-attrs"):
-                attrs = parse_attrs_header(response["headers"]["x-amz-meta-s3cmd-attrs"])
-                response["s3cmd-attrs"] = attrs
             debug("Response: " + str(response))
-            ConnMan.put(conn)
-        except ParameterError, e:
-            raise
+            if close_conn is True:
+                conn.close()
         except Exception, e:
             if retries:
                 warning("Retrying failed request: %s (%s)" % (resource['uri'], e))
@@ -718,13 +716,12 @@ class S3(object):
             info("Sending file '%s', please wait..." % file.name)
         timestamp_start = time.time()
         try:
-            conn = ConnMan.get(self.get_hostname(resource['bucket']))
-            conn.c.putrequest(method_string, self.format_uri(resource))
+            conn = self.get_connection(resource['bucket'])
+            conn.connect()
+            conn.putrequest(method_string, self.format_uri(resource))
             for header in headers.keys():
-                conn.c.putheader(header, str(headers[header]))
-            conn.c.endheaders()
-        except ParameterError, e:
-            raise
+                conn.putheader(header, str(headers[header]))
+            conn.endheaders()
         except Exception, e:
             if self.config.progress_meter:
                 progress.done("failed")
@@ -747,7 +744,7 @@ class S3(object):
                 else:
                     data = buffer
                 md5_hash.update(data)
-                conn.c.send(data)
+                conn.send(data)
                 if self.config.progress_meter:
                     progress.update(delta_position = len(data))
                 size_left -= len(data)
@@ -755,16 +752,14 @@ class S3(object):
                     time.sleep(throttle)
             md5_computed = md5_hash.hexdigest()
             response = {}
-            http_response = conn.c.getresponse()
+            http_response = conn.getresponse()
             response["status"] = http_response.status
             response["reason"] = http_response.reason
             response["headers"] = convertTupleListToDict(http_response.getheaders())
             response["data"] = http_response.read()
             response["size"] = size_total
-            ConnMan.put(conn)
+            conn.close()
             debug(u"Response: %s" % response)
-        except ParameterError, e:
-            raise
         except Exception, e:
             if self.config.progress_meter:
                 progress.done("failed")
@@ -786,7 +781,7 @@ class S3(object):
         response["speed"] = response["elapsed"] and float(response["size"]) / response["elapsed"] or float(-1)
 
         if self.config.progress_meter:
-            ## Finalising the upload takes some time -> update() progress meter
+            ## The above conn.close() takes some time -> update() progress meter
             ## to correct the average speed. Otherwise people will complain that
             ## 'progress' and response["speed"] are inconsistent ;-)
             progress.update()
@@ -861,25 +856,21 @@ class S3(object):
             info("Receiving file '%s', please wait..." % stream.name)
         timestamp_start = time.time()
         try:
-            conn = ConnMan.get(self.get_hostname(resource['bucket']))
-            conn.c.putrequest(method_string, self.format_uri(resource))
+            conn = self.get_connection(resource['bucket'])
+            conn.connect()
+            conn.putrequest(method_string, self.format_uri(resource))
             for header in headers.keys():
-                conn.c.putheader(header, str(headers[header]))
+                conn.putheader(header, str(headers[header]))
             if start_position > 0:
                 debug("Requesting Range: %d .. end" % start_position)
-                conn.c.putheader("Range", "bytes=%d-" % start_position)
-            conn.c.endheaders()
+                conn.putheader("Range", "bytes=%d-" % start_position)
+            conn.endheaders()
             response = {}
-            http_response = conn.c.getresponse()
+            http_response = conn.getresponse()
             response["status"] = http_response.status
             response["reason"] = http_response.reason
             response["headers"] = convertTupleListToDict(http_response.getheaders())
-            if response["headers"].has_key("x-amz-meta-s3cmd-attrs"):
-                attrs = parse_attrs_header(response["headers"]["x-amz-meta-s3cmd-attrs"])
-                response["s3cmd-attrs"] = attrs
             debug("Response: %s" % response)
-        except ParameterError, e:
-            raise
         except Exception, e:
             if self.config.progress_meter:
                 progress.done("failed")
@@ -931,7 +922,7 @@ class S3(object):
                 ## Call progress meter from here...
                 if self.config.progress_meter:
                     progress.update(delta_position = len(data))
-            ConnMan.put(conn)
+            conn.close()
         except Exception, e:
             if self.config.progress_meter:
                 progress.done("failed")
@@ -967,13 +958,7 @@ class S3(object):
                 warning("Unable to verify MD5. Assume it matches.")
                 response["md5"] = response["headers"]["etag"]
 
-        md5_hash = response["headers"]["etag"]
-        try:
-            md5_hash = response["s3cmd-attrs"]["md5"]
-        except KeyError:
-            pass
-
-        response["md5match"] = md5_hash.find(response["md5"]) >= 0
+        response["md5match"] = response["headers"]["etag"].find(response["md5"]) >= 0
         response["elapsed"] = timestamp_end - timestamp_start
         response["size"] = current_position
         response["speed"] = response["elapsed"] and float(response["size"]) / response["elapsed"] or float(-1)
@@ -983,14 +968,8 @@ class S3(object):
         debug("ReceiveFile: Computed MD5 = %s" % response["md5"])
         if not response["md5match"]:
             warning("MD5 signatures do not match: computed=%s, received=%s" % (
-                response["md5"], md5_hash))
+                response["md5"], response["headers"]["etag"]))
         return response
 __all__.append("S3")
 
-def parse_attrs_header(attrs_header):
-    attrs = {}
-    for attr in attrs_header.split("/"):
-        key, val = attr.split(":")
-        attrs[key] = val
-    return attrs
 # vim:et:ts=4:sts=4:ai

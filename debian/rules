@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 # -*- makefile -*-
 
-PACKAGE_NAME=s3cmd
+PACKAGE_NAME=s3cmd-stvp
 PACKAGE_DIR=$(CURDIR)/debian/$(PACKAGE_NAME)
 
 SHARE_DIR=/usr/share/s3cmd
